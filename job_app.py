@@ -2,16 +2,11 @@ import streamlit as st
 import requests
 import json
 import re
-import smtplib
-import ssl
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
 from io import BytesIO
 from urllib.parse import quote
 import sys
 import subprocess
+import base64
 
 # ---------------------- Page & Theming ----------------------
 
@@ -54,12 +49,13 @@ add_bg_gif(BACKGROUND_GIF_URL)
 
 # ---------------------- Secrets / Config ----------------------
 
+# Required secrets (no Gmail creds)
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
-    GMAIL_USERNAME = st.secrets["GMAIL_USERNAME"]
-    GMAIL_APP_PASSWORD = st.secrets["GMAIL_APP_PASSWORD"]
+    SENDGRID_API_KEY = st.secrets["SENDGRID_API_KEY"]
+    SENDGRID_FROM_EMAIL = st.secrets["SENDGRID_FROM_EMAIL"]
 except (KeyError, AttributeError):
-    st.error("Missing required secrets. Please set GOOGLE_API_KEY, GMAIL_USERNAME, and GMAIL_APP_PASSWORD in Streamlit secrets.")
+    st.error("Missing required secrets. Set GOOGLE_API_KEY, SENDGRID_API_KEY, and SENDGRID_FROM_EMAIL in Streamlit secrets.")
     st.stop()
 
 MODEL_NAME = st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash")
@@ -124,7 +120,7 @@ def _gemini_rest_generate_content(prompt: str, model: str, api_key: str, timeout
     except (KeyError, IndexError, TypeError):
         return ""
 
-def get_gemini_response(prompt: str, retries: int = 3) -> str | None:
+def get_gemini_response(prompt: str, retries: int = 3):
     last_error = None
     for attempt in range(1, retries + 1):
         try:
@@ -141,13 +137,12 @@ def get_gemini_response(prompt: str, retries: int = 3) -> str | None:
 
 # ---------------------- PDF Parsing ----------------------
 
-def extract_text_from_pdf(file_bytes: bytes) -> str | None:
+def extract_text_from_pdf(file_bytes: bytes):
     _ensure_pdf_reader()
     try:
         reader = PdfReader(BytesIO(file_bytes))
         text_chunks = []
         for page in getattr(reader, "pages", []):
-            # PyPDF2 and pypdf both support extract_text()
             pg = page.extract_text() or ""
             if pg.strip():
                 text_chunks.append(pg)
@@ -160,7 +155,7 @@ def extract_text_from_pdf(file_bytes: bytes) -> str | None:
 
 # ---------------------- Query Generation ----------------------
 
-def generate_search_queries_from_resume(resume_text: str) -> list[str]:
+def generate_search_queries_from_resume(resume_text: str):
     prompt = f"""
 Analyze the following resume and generate exactly 6 diverse job search queries.
 Mix general and specific searches (role, tech, seniority, location, remote/hybrid).
@@ -194,7 +189,7 @@ Resume:
 
 # ---------------------- Job Search (Remotive + RemoteOK) ----------------------
 
-def search_remotive(query: str, limit: int = 20) -> list[dict]:
+def search_remotive(query: str, limit: int = 20):
     url = "https://remotive.com/api/remote-jobs"
     params = {"search": query}
     r = requests.get(url, params=params, timeout=30)
@@ -210,12 +205,12 @@ def search_remotive(query: str, limit: int = 20) -> list[dict]:
             "location": j.get("candidate_required_location"),
             "tags": j.get("tags") or [],
             "url": j.get("url"),
-            "apply_email": None,  # Usually links out
+            "apply_email": None,
             "description": j.get("description") or "",
         })
     return out
 
-def search_remoteok(query: str, limit: int = 20) -> list[dict]:
+def search_remoteok(query: str, limit: int = 20):
     url = "https://remoteok.com/api"
     r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
@@ -248,7 +243,7 @@ def search_remoteok(query: str, limit: int = 20) -> list[dict]:
             break
     return jobs
 
-def aggregate_jobs(queries: list[str], per_query_limit: int = 20, max_total: int = 60) -> list[dict]:
+def aggregate_jobs(queries, per_query_limit: int = 20, max_total: int = 60):
     seen_urls = set()
     results = []
     for q in queries:
@@ -268,6 +263,56 @@ def aggregate_jobs(queries: list[str], per_query_limit: int = 20, max_total: int
         if len(results) >= max_total:
             break
     return results[:max_total]
+
+
+# ---------------------- Send Email via SendGrid ----------------------
+
+def send_email_sendgrid(
+    to_email: str,
+    subject: str,
+    body_text: str,
+    attachment_name: str = None,
+    attachment_bytes: bytes = None,
+    cc: list = None,
+):
+    """
+    Sends a plain-text email using SendGrid API. Requires:
+    - SENDGRID_API_KEY
+    - SENDGRID_FROM_EMAIL
+    """
+    url = "https://api.sendgrid.com/v3/mail/send"
+    headers = {
+        "Authorization": f"Bearer {SENDGRID_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    personalization = {"to": [{"email": to_email}]}
+    if cc:
+        personalization["cc"] = [{"email": c} for c in cc]
+    personalization["subject"] = subject
+
+    payload = {
+        "personalizations": [personalization],
+        "from": {"email": SENDGRID_FROM_EMAIL, "name": "AI Job Hunter"},
+        "content": [{"type": "text/plain", "value": body_text}],
+    }
+
+    if attachment_bytes and attachment_name:
+        payload["attachments"] = [{
+            "content": base64.b64encode(attachment_bytes).decode("utf-8"),
+            "type": "application/pdf",
+            "filename": attachment_name,
+            "disposition": "attachment"
+        }]
+
+    resp = requests.post(url, headers=headers, json=payload, timeout=30)
+    if resp.status_code in (200, 202):
+        return True, "sent"
+    else:
+        try:
+            return False, f"{resp.status_code}: {resp.text}"
+        except Exception:
+            return False, f"{resp.status_code}: failed to send"
 
 
 # ---------------------- Cover Letter & Auto-Apply (Email) ----------------------
@@ -290,42 +335,7 @@ Job:
     text = get_gemini_response(prompt) or ""
     return text.strip()
 
-def send_email(
-    to_email: str,
-    subject: str,
-    body_text: str,
-    attachment_name: str | None = None,
-    attachment_bytes: bytes | None = None,
-    cc: list[str] | None = None,
-) -> tuple[bool, str]:
-    try:
-        msg = MIMEMultipart()
-        msg["From"] = GMAIL_USERNAME
-        msg["To"] = to_email
-        if cc:
-            msg["Cc"] = ", ".join(cc)
-        msg["Subject"] = subject
-
-        msg.attach(MIMEText(body_text, "plain"))
-
-        if attachment_bytes and attachment_name:
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(attachment_bytes)
-            encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f'attachment; filename="{attachment_name}"')
-            msg.attach(part)
-
-        recipients = [to_email] + (cc or [])
-        context = ssl.create_default_context()
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.starttls(context=context)
-            server.login(GMAIL_USERNAME, GMAIL_APP_PASSWORD)
-            server.sendmail(GMAIL_USERNAME, recipients, msg.as_string())
-        return True, "sent"
-    except Exception as e:
-        return False, str(e)
-
-def attempt_auto_apply_by_email(job: dict, resume_bytes: bytes, resume_filename: str, resume_text: str, candidate_email: str, candidate_name: str) -> dict:
+def attempt_auto_apply_by_email(job, resume_bytes, resume_filename, resume_text, candidate_email, candidate_name):
     to_addr = job.get("apply_email")
     if not to_addr:
         return {"applied": False, "reason": "No apply email available", "details": ""}
@@ -336,13 +346,13 @@ def attempt_auto_apply_by_email(job: dict, resume_bytes: bytes, resume_filename:
     cover += f"\n\nBest regards,\n{candidate_name}\nEmail: {candidate_email}"
 
     subject = f"Application: {title} at {company} — {candidate_name}"
-    ok, msg = send_email(
+    ok, msg = send_email_sendgrid(
         to_email=to_addr,
         subject=subject,
         body_text=cover,
         attachment_name=resume_filename,
         attachment_bytes=resume_bytes,
-        cc=[candidate_email],
+        cc=[candidate_email],  # CC you on the application
     )
     return {
         "applied": ok,
@@ -353,13 +363,7 @@ def attempt_auto_apply_by_email(job: dict, resume_bytes: bytes, resume_filename:
 
 # ---------------------- Report Email to You ----------------------
 
-def send_summary_report(
-    recipient_email: str,
-    candidate_name: str,
-    queries: list[str],
-    jobs: list[dict],
-    application_results: list[dict],
-):
+def send_summary_report(recipient_email, candidate_name, queries, jobs, application_results):
     lines = []
     lines.append(f"Hi {candidate_name or 'there'},")
     lines.append("")
@@ -392,8 +396,7 @@ def send_summary_report(
 
     body = "\n".join(lines)
     subject = "Your AI Job Hunter Report"
-    ok, msg = send_email(to_email=recipient_email, subject=subject, body_text=body)
-    return ok, msg
+    return send_email_sendgrid(to_email=recipient_email, subject=subject, body_text=body)
 
 
 # ---------------------- UI ----------------------
