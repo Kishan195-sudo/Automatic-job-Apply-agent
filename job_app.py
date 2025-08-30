@@ -17,7 +17,6 @@ st.set_page_config(
 )
 
 # Background GIF (replace with your own if desired)
-BACKGROUND_GIF_URL = "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExZ2JmN3dyeG5laGZtYWMyY2dnOGpoZndjM3ZxYjZxOTF5cWF1ZzFwdiZlcD12MV9naWZzX3NlYXJjaCZjdD1n/gw3IWyGkC0rsazTi3U/giphy.gif"
 
 def add_bg_gif(gif_url: str):
     st.markdown(
