@@ -10,8 +10,8 @@ from email.mime.base import MIMEBase
 from email import encoders
 from io import BytesIO
 from urllib.parse import quote
-import PyPDF2  # required (not optional)
-
+import sys
+import subprocess
 
 # ---------------------- Page & Theming ----------------------
 
@@ -34,14 +34,14 @@ def add_bg_gif(gif_url: str):
         }}
         /* Glass effect for main content */
         .main > div {{
-            background: rgba(255, 255, 255, 0.80);
+            background: rgba(255, 255, 255, 0.82);
             backdrop-filter: blur(6px);
             border-radius: 12px;
             padding: 1rem 1.2rem;
         }}
         /* Sidebar styling */
         [data-testid="stSidebar"] > div:first-child {{
-            background: rgba(255, 255, 255, 0.88);
+            background: rgba(255, 255, 255, 0.9);
             backdrop-filter: blur(6px);
         }}
         </style>
@@ -54,7 +54,6 @@ add_bg_gif(BACKGROUND_GIF_URL)
 
 # ---------------------- Secrets / Config ----------------------
 
-# Required secrets
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
     GMAIL_USERNAME = st.secrets["GMAIL_USERNAME"]
@@ -63,8 +62,47 @@ except (KeyError, AttributeError):
     st.error("Missing required secrets. Please set GOOGLE_API_KEY, GMAIL_USERNAME, and GMAIL_APP_PASSWORD in Streamlit secrets.")
     st.stop()
 
-# Model (Gemini REST)
 MODEL_NAME = st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash")
+
+
+# ---------------------- PDF Reader bootstrap ----------------------
+
+PdfReader = None
+
+def _ensure_pdf_reader():
+    """
+    Ensure we have a PdfReader available:
+    - Try PyPDF2
+    - Try pypdf
+    - If both missing, attempt runtime install of pypdf
+    """
+    global PdfReader
+    if PdfReader is not None:
+        return
+
+    try:
+        from PyPDF2 import PdfReader as _PdfReader
+        PdfReader = _PdfReader
+        return
+    except Exception:
+        pass
+
+    try:
+        from pypdf import PdfReader as _PdfReader
+        PdfReader = _PdfReader
+        return
+    except Exception:
+        pass
+
+    # Attempt runtime install of pypdf
+    try:
+        with st.spinner("Installing PDF parser (pypdf) ..."):
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "pypdf", "-q"])
+        from pypdf import PdfReader as _PdfReader
+        PdfReader = _PdfReader
+    except Exception as e:
+        st.error(f"Could not import or install a PDF parser (PyPDF2/pypdf). Error: {e}")
+        st.stop()
 
 
 # ---------------------- LLM Helpers (Gemini via REST) ----------------------
@@ -104,10 +142,12 @@ def get_gemini_response(prompt: str, retries: int = 3) -> str | None:
 # ---------------------- PDF Parsing ----------------------
 
 def extract_text_from_pdf(file_bytes: bytes) -> str | None:
+    _ensure_pdf_reader()
     try:
-        reader = PyPDF2.PdfReader(BytesIO(file_bytes))
+        reader = PdfReader(BytesIO(file_bytes))
         text_chunks = []
-        for page in reader.pages:
+        for page in getattr(reader, "pages", []):
+            # PyPDF2 and pypdf both support extract_text()
             pg = page.extract_text() or ""
             if pg.strip():
                 text_chunks.append(pg)
@@ -134,14 +174,12 @@ Resume:
     response = get_gemini_response(prompt)
     if not response:
         return []
-    # Parse JSON
     try:
         obj = json.loads(response)
         queries = obj.get("queries", [])
         queries = [str(q).strip() for q in queries if str(q).strip()]
         return queries[:6]
     except json.JSONDecodeError:
-        # fallback: try to find JSON object inside
         m = re.search(r"\{.*\}", response, flags=re.DOTALL)
         if m:
             try:
@@ -172,7 +210,7 @@ def search_remotive(query: str, limit: int = 20) -> list[dict]:
             "location": j.get("candidate_required_location"),
             "tags": j.get("tags") or [],
             "url": j.get("url"),
-            "apply_email": None,  # Remotive usually links out to ATS
+            "apply_email": None,  # Usually links out
             "description": j.get("description") or "",
         })
     return out
@@ -183,7 +221,6 @@ def search_remoteok(query: str, limit: int = 20) -> list[dict]:
     r.raise_for_status()
     data = r.json()
     jobs = []
-    # First element is metadata; skip non-job dicts
     for item in data:
         if not isinstance(item, dict):
             continue
@@ -193,8 +230,7 @@ def search_remoteok(query: str, limit: int = 20) -> list[dict]:
         company = item.get("company") or item.get("company_name")
         url_ = item.get("url") or item.get("apply_url") or item.get("slug")
         location = item.get("location") or item.get("region") or "Remote"
-        apply_email = item.get("apply_email")  # sometimes present
-        # Filter by query terms (simple contains any token)
+        apply_email = item.get("apply_email")
         q_tokens = [t for t in re.split(r"[,\s]+", query.lower()) if t]
         text_blob = " ".join([title.lower(), description, " ".join([t.lower() for t in tags])])
         if any(tok in text_blob for tok in q_tokens):
@@ -252,7 +288,6 @@ Job:
 - Company: {company}
 """
     text = get_gemini_response(prompt) or ""
-    # Basic cleanup if model adds extra spacing
     return text.strip()
 
 def send_email(
@@ -290,7 +325,6 @@ def send_email(
     except Exception as e:
         return False, str(e)
 
-
 def attempt_auto_apply_by_email(job: dict, resume_bytes: bytes, resume_filename: str, resume_text: str, candidate_email: str, candidate_name: str) -> dict:
     to_addr = job.get("apply_email")
     if not to_addr:
@@ -299,8 +333,6 @@ def attempt_auto_apply_by_email(job: dict, resume_bytes: bytes, resume_filename:
     company = job.get("company") or "Hiring Team"
     title = job.get("title") or "Role"
     cover = generate_cover_letter(resume_text, title, company)
-
-    # Add candidate contact footer
     cover += f"\n\nBest regards,\n{candidate_name}\nEmail: {candidate_email}"
 
     subject = f"Application: {title} at {company} — {candidate_name}"
@@ -310,7 +342,7 @@ def attempt_auto_apply_by_email(job: dict, resume_bytes: bytes, resume_filename:
         body_text=cover,
         attachment_name=resume_filename,
         attachment_bytes=resume_bytes,
-        cc=[candidate_email],  # CC you on each application email
+        cc=[candidate_email],
     )
     return {
         "applied": ok,
@@ -346,11 +378,13 @@ def send_summary_report(
         src = j.get("source") or "Unknown"
         applied = res.get("applied", False)
         status = "APPLIED (email)" if applied else f"NOT APPLIED ({res.get('reason', 'n/a')})"
+        if url:
+            lines.append(f"- [{src}] {title} — {company} — {status}\n  Link: {url}")
+        else:
+            lines.append(f"- [{src}] {title} — {company} — {status}")
         if applied:
             applied_count += 1
-        lines.append(f"- [{src}] {title} — {company} — {status}")
-        if url:
-            lines.append(f"  Link: {url}")
+
     lines.append("")
     lines.append(f"Total applied (via email): {applied_count} of {len(jobs)}")
     lines.append("")
@@ -365,7 +399,7 @@ def send_summary_report(
 # ---------------------- UI ----------------------
 
 st.title("🤖 AI Job Hunter & Auto‑Apply")
-st.markdown("Let the assistant analyze your resume, find matching jobs, attempt email-based applications where possible, and send you a report.")
+st.markdown("Analyze your resume, find matching jobs, auto-apply by email when possible, and get a summary via email.")
 
 with st.sidebar:
     st.header("Upload & Preferences")
@@ -412,7 +446,14 @@ if start_button:
     st.success(f"Found {len(jobs)} jobs across sources.")
     st.markdown("Preview of top matches:")
     for j in jobs[:15]:
-        st.markdown(f"- [{j.get('title','Untitled')}]({j.get('url','')}) — {j.get('company','N/A')} ({j.get('source','')})")
+        link = j.get("url", "")
+        title = j.get("title","Untitled")
+        company = j.get("company","N/A")
+        src = j.get("source","")
+        if link:
+            st.markdown(f"- [{title}]({link}) — {company} ({src})")
+        else:
+            st.markdown(f"- {title} — {company} ({src})")
 
     application_results = []
     if auto_apply_toggle:
